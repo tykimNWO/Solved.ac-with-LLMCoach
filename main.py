@@ -6,13 +6,13 @@ import subprocess
 import tempfile
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from fastapi.responses import StreamingResponse
 from src.recommender import stream_chat_response
 from src.database import DatabaseManager
 
-from typing import List
+from typing import List, Optional
 
 # 💡 DB 경로 설정 (에러 방지를 위한 절대 경로)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -40,8 +40,8 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str
-    history: List[ChatMessage] = []
-    current_problem_id: int = None
+    history: List[ChatMessage] = Field(default_factory=list)
+    current_problem_id: Optional[int] = None
 
 class JudgeRequest(BaseModel):
     problem_id: int

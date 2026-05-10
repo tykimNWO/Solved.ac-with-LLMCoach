@@ -1,5 +1,5 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Send, Sparkles, Brain, Code2, MessageSquare, FileCode2, Search, Code, Notebook, CheckCircle2 } from 'lucide-react';
+import React, { useState, useRef, useEffect } from 'react';
+import { Send, Sparkles, Brain, Code2, MessageSquare, FileCode2, Search, Code, Notebook, CheckCircle2, Clock3, ListChecks, Loader2, AlertCircle, ExternalLink, Circle } from 'lucide-react';
 import CodeMirror from '@uiw/react-codemirror';
 import { python } from '@codemirror/lang-python';
 import { markdown } from '@codemirror/lang-markdown';
@@ -7,29 +7,191 @@ import { vscodeDark } from '@uiw/codemirror-theme-vscode';
 
 const API_BASE_URL = 'http://localhost:8000/api';
 
-const getTierInfo = (tier: number) => {
-  if (!tier || tier === 0) return { name: "Unrated", color: "text-gray-400", bg: "bg-gray-400/10", border: "border-gray-400/30" };
-  if (tier <= 5) return { name: `Bronze ${6 - tier}`, color: "text-[#ad5600]", bg: "bg-[#ad5600]/10", border: "border-[#ad5600]/30" };
-  if (tier <= 10) return { name: `Silver ${11 - tier}`, color: "text-[#435f7a]", bg: "bg-[#435f7a]/10", border: "border-[#435f7a]/30" };
-  if (tier <= 15) return { name: `Gold ${16 - tier}`, color: "text-[#ec9a00]", bg: "bg-[#ec9a00]/10", border: "border-[#ec9a00]/30" };
-  if (tier <= 20) return { name: `Platinum ${21 - tier}`, color: "text-[#27e2a4]", bg: "bg-[#27e2a4]/10", border: "border-[#27e2a4]/30" };
-  if (tier <= 25) return { name: `Diamond ${26 - tier}`, color: "text-[#00b4fc]", bg: "bg-[#00b4fc]/10", border: "border-[#00b4fc]/30" };
-  return { name: `Ruby ${31 - tier}`, color: "text-[#ff0062]", bg: "bg-[#ff0062]/10", border: "border-[#ff0062]/30" };
+type RecommendationStatus = 'idle' | 'loading' | 'reasoning' | 'success' | 'error';
+type RecommendationStepStatus = 'pending' | 'running' | 'completed' | 'error';
+
+interface RecommendationStep {
+  id: string;
+  label: string;
+  status: RecommendationStepStatus;
+  timestamp?: number;
+}
+
+interface RecommendedProblem {
+  rank: number;
+  problemId: number | string;
+  title: string;
+  tier?: string;
+  level?: number;
+  tags?: string[];
+  reason: string;
+  learningEffect?: string;
+  solvedAcUrl?: string;
+}
+
+interface RecommendationResult {
+  recommendations: RecommendedProblem[];
+  elapsedMs: number;
+  summary?: string;
+}
+
+interface ProblemData {
+  description: string;
+  input_desc: string;
+  output_desc: string;
+  sample_inputs: string[];
+  sample_outputs: string[];
+  problem_limit?: string;
+  title?: string;
+  tier: number;
+  tags: string[];
+  is_solved?: boolean;
+}
+
+interface JudgeResult {
+  case: number;
+  result: string;
+  time?: string;
+  error?: string;
+  actual?: string;
+  expected?: string;
+}
+
+interface ChatMessage {
+  role: 'user' | 'ai';
+  text: string;
+  elapsed?: number;
+  recommendationResult?: RecommendationResult;
+}
+
+const RECOMMENDATION_RESULT_START = '[RECOMMENDATION_RESULT]';
+const RECOMMENDATION_RESULT_END = '[/RECOMMENDATION_RESULT]';
+
+const RECOMMENDATION_STEPS: RecommendationStep[] = [
+  { id: 'profile', label: 'solved.ac 프로필 데이터를 확인하고 있습니다.', status: 'pending' },
+  { id: 'patterns', label: '최근 풀이 난이도와 태그 패턴을 분석하고 있습니다.', status: 'pending' },
+  { id: 'candidates', label: '추천 후보 문제를 생성하고 있습니다.', status: 'pending' },
+  { id: 'ranking', label: 'Top-3 추천 문제와 추천 이유를 정리하고 있습니다.', status: 'pending' },
+];
+
+const parseTierLevel = (tier?: number | string) => {
+  if (typeof tier === 'number') return tier;
+  if (!tier) return 0;
+  const match = tier.match(/^(Bronze|Silver|Gold|Platinum|Diamond|Ruby)\s+([1-5])$/i);
+  if (!match) {
+    const numericTier = Number.parseInt(tier, 10);
+    return Number.isFinite(numericTier) ? numericTier : 0;
+  }
+  const rank = Number.parseInt(match[2], 10);
+  const baseByGroup: Record<string, number> = {
+    bronze: 0,
+    silver: 5,
+    gold: 10,
+    platinum: 15,
+    diamond: 20,
+    ruby: 25,
+  };
+  return baseByGroup[match[1].toLowerCase()] + (6 - rank);
+};
+
+const getTierInfo = (tier?: number | string) => {
+  const level = parseTierLevel(tier);
+  if (!level || level === 0) return { name: "Unrated", color: "text-gray-400", bg: "bg-gray-400/10", border: "border-gray-400/30" };
+  if (level <= 5) return { name: `Bronze ${6 - level}`, color: "text-[#ad5600]", bg: "bg-[#ad5600]/10", border: "border-[#ad5600]/30" };
+  if (level <= 10) return { name: `Silver ${11 - level}`, color: "text-[#435f7a]", bg: "bg-[#435f7a]/10", border: "border-[#435f7a]/30" };
+  if (level <= 15) return { name: `Gold ${16 - level}`, color: "text-[#ec9a00]", bg: "bg-[#ec9a00]/10", border: "border-[#ec9a00]/30" };
+  if (level <= 20) return { name: `Platinum ${21 - level}`, color: "text-[#27e2a4]", bg: "bg-[#27e2a4]/10", border: "border-[#27e2a4]/30" };
+  if (level <= 25) return { name: `Diamond ${26 - level}`, color: "text-[#00b4fc]", bg: "bg-[#00b4fc]/10", border: "border-[#00b4fc]/30" };
+  return { name: `Ruby ${31 - level}`, color: "text-[#ff0062]", bg: "bg-[#ff0062]/10", border: "border-[#ff0062]/30" };
+};
+
+const formatElapsed = (ms: number) => `${(ms / 1000).toFixed(1)}초`;
+
+const createInitialRecommendationSteps = (): RecommendationStep[] =>
+  RECOMMENDATION_STEPS.map((step) => ({ ...step, status: 'pending' }));
+
+const isRecommendationPrompt = (text: string) =>
+  ['추천', '문제 줘', '문제 찾아', '풀 문제', '복습', '약점', '오늘의 추천'].some((keyword) => text.includes(keyword));
+
+const stripRecommendationMarkup = (text: string) =>
+  text
+    .replace(/\[RECOMMENDATION_STEP:[^\]]+\]\n?/g, '')
+    .replace(/\[SAFE_PROGRESS\][\s\S]*?\[\/SAFE_PROGRESS\]\n?/g, '')
+    .replace(/\[THOUGHT\][\s\S]*?\[\/THOUGHT\]\n?/g, '')
+    .replace(/\[LOAD_PROBLEM:\d+\]/g, '')
+    .replace(/\[RECOMMENDATION_RESULT\][\s\S]*?\[\/RECOMMENDATION_RESULT\]/g, '')
+    .trim();
+
+const normalizeRecommendationResponse = (response: unknown, elapsedMs: number): RecommendationResult | null => {
+  if (!response || typeof response !== 'object') return null;
+  const data = response as Record<string, unknown>;
+  const rawItems = Array.isArray(data.recommendations) ? data.recommendations : [];
+
+  const recommendations = rawItems
+    .slice(0, 3)
+    .map((item, index): RecommendedProblem | null => {
+      if (!item || typeof item !== 'object') return null;
+      const raw = item as Record<string, unknown>;
+      const problemId = raw.problemId ?? raw.problem_id ?? raw.id;
+      if (typeof problemId !== 'string' && typeof problemId !== 'number') return null;
+
+      const tags = Array.isArray(raw.tags) ? raw.tags.map(String).slice(0, 5) : [];
+      return {
+        rank: typeof raw.rank === 'number' ? raw.rank : index + 1,
+        problemId,
+        title: typeof raw.title === 'string' && raw.title.trim() ? raw.title : '제목 없음',
+        tier: typeof raw.tier === 'string' ? raw.tier : undefined,
+        level: typeof raw.level === 'number' ? raw.level : undefined,
+        tags,
+        reason: typeof raw.reason === 'string' && raw.reason.trim() ? raw.reason : '현재 학습 조건에 맞는 후보 문제입니다.',
+        learningEffect: typeof raw.learningEffect === 'string' ? raw.learningEffect : undefined,
+        solvedAcUrl: typeof raw.solvedAcUrl === 'string' ? raw.solvedAcUrl : undefined,
+      };
+    })
+    .filter((item): item is RecommendedProblem => item !== null)
+    .map((item, index) => ({ ...item, rank: index + 1 }));
+
+  if (recommendations.length === 0) return null;
+  return {
+    recommendations,
+    elapsedMs,
+    summary: typeof data.summary === 'string' ? data.summary : undefined,
+  };
+};
+
+const parseRecommendationResult = (text: string, elapsedMs: number): RecommendationResult | null => {
+  const start = text.indexOf(RECOMMENDATION_RESULT_START);
+  const end = text.indexOf(RECOMMENDATION_RESULT_END);
+  if (start === -1 || end === -1 || end <= start) return null;
+
+  const rawJson = text.substring(start + RECOMMENDATION_RESULT_START.length, end).trim();
+  try {
+    return normalizeRecommendationResponse(JSON.parse(rawJson), elapsedMs);
+  } catch (error) {
+    console.error('추천 결과 파싱 실패:', error);
+    return null;
+  }
 };
 
 function App() {
   const [input, setInput] = useState('');
-  const [messages, setMessages] = useState<{role: 'user' | 'ai', text: string, elapsed?: number}[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isLoading, setIsLoading] = useState(false);
-  const [thinkingText, setThinkingText] = useState('');
   const sendTimeRef = useRef<number>(0);
+  const recommendationStartRef = useRef<number>(0);
+  const recommendationTimerRef = useRef<number | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const [recommendationStatus, setRecommendationStatus] = useState<RecommendationStatus>('idle');
+  const [recommendationSteps, setRecommendationSteps] = useState<RecommendationStep[]>(createInitialRecommendationSteps);
+  const [recommendationElapsedMs, setRecommendationElapsedMs] = useState(0);
+  const [recommendationError, setRecommendationError] = useState('');
+  const [isProcessOpen, setIsProcessOpen] = useState(true);
 
   const [activeTab, setActiveTab] = useState<'chat' | 'problem' | 'editor' | 'memo'>('chat');
   const [searchProblemId, setSearchProblemId] = useState('');
-  const [problemData, setProblemData] = useState<any>(null);
+  const [problemData, setProblemData] = useState<ProblemData | null>(null);
   const [userCode, setUserCode] = useState('# 여기에 파이썬 코드를 작성하세요\n\nimport sys\n\ndef solution():\n    # input = sys.stdin.readline\n    pass\n\nif __name__ == "__main__":\n    solution()');
-  const [judgeResults, setJudgeResults] = useState<any[] | null>(null);
+  const [judgeResults, setJudgeResults] = useState<JudgeResult[] | null>(null);
   
   // 메모 전용 상태
   const [memo, setMemo] = useState('');
@@ -43,7 +205,14 @@ function App() {
         const res = await fetch(`${API_BASE_URL}/chat/history`);
         const data = await res.json();
         if (data.status === 'success') {
-          setMessages(data.history);
+          const history = Array.isArray(data.history)
+            ? data.history.map((msg: { role: string; text: string }) => ({
+              role: msg.role === 'user' ? 'user' as const : 'ai' as const,
+              text: stripRecommendationMarkup(msg.text || ''),
+              recommendationResult: msg.role === 'ai' ? parseRecommendationResult(msg.text || '', 0) ?? undefined : undefined,
+            }))
+            : [];
+          setMessages(history);
         }
       } catch (err) {
         console.error("히스토리 로드 실패:", err);
@@ -60,11 +229,66 @@ function App() {
   }, [messages, activeTab]);
 
   useEffect(() => {
-    if (textareaRef.current) {
-      textareaRef.current.style.height = 'auto';
-      textareaRef.current.style.height = `${textareaRef.current.scrollHeight}px`;
+    return () => {
+      if (recommendationTimerRef.current) {
+        window.clearInterval(recommendationTimerRef.current);
+      }
+    };
+  }, []);
+
+  const startRecommendationTimer = () => {
+    recommendationStartRef.current = Date.now();
+    setRecommendationElapsedMs(0);
+    if (recommendationTimerRef.current) {
+      window.clearInterval(recommendationTimerRef.current);
     }
-  }, [input]);
+    recommendationTimerRef.current = window.setInterval(() => {
+      setRecommendationElapsedMs(Date.now() - recommendationStartRef.current);
+    }, 100);
+  };
+
+  const stopRecommendationTimer = () => {
+    if (recommendationTimerRef.current) {
+      window.clearInterval(recommendationTimerRef.current);
+      recommendationTimerRef.current = null;
+    }
+    if (recommendationStartRef.current) {
+      setRecommendationElapsedMs(Date.now() - recommendationStartRef.current);
+    }
+  };
+
+  const beginRecommendationFlow = () => {
+    setRecommendationStatus('loading');
+    setRecommendationSteps(createInitialRecommendationSteps());
+    setRecommendationError('');
+    setIsProcessOpen(true);
+    startRecommendationTimer();
+  };
+
+  const completeRecommendationFlow = (status: RecommendationStatus) => {
+    stopRecommendationTimer();
+    setRecommendationStatus(status);
+    setRecommendationSteps((prev) => prev.map((step) => {
+      if (status === 'success') return { ...step, status: 'completed' };
+      if (step.status === 'running') return { ...step, status: 'error' };
+      return step;
+    }));
+  };
+
+  const markRecommendationStepFromChunk = (chunk: string) => {
+    const matches = [...chunk.matchAll(/\[RECOMMENDATION_STEP:([^\]]+)\]/g)];
+    matches.forEach((match) => {
+      const stepId = match[1];
+      const stepIndex = RECOMMENDATION_STEPS.findIndex((step) => step.id === stepId);
+      if (stepIndex === -1) return;
+      setRecommendationStatus('reasoning');
+      setRecommendationSteps((prev) => prev.map((step, index) => {
+        if (index < stepIndex) return { ...step, status: 'completed' };
+        if (index === stepIndex) return { ...step, status: 'running', timestamp: Date.now() };
+        return step.status === 'completed' ? step : { ...step, status: 'pending' };
+      }));
+    });
+  };
 
   const suggestions = [
     { icon: <Sparkles className="w-5 h-5 text-yellow-400" />, title: "오늘의 추천", text: "나의 현재 실력에 딱 맞는 플래티넘 도약용 문제 추천해줘." },
@@ -75,94 +299,100 @@ function App() {
   const handleSend = async () => {
     if (!input.trim() || isLoading) return;
     const userText = input;
+    const requestIsRecommendation = isRecommendationPrompt(userText);
     setInput('');
     setMessages(prev => [...prev, { role: 'user', text: userText }, { role: 'ai', text: '' }]);
     setIsLoading(true);
-    setThinkingText('');
     sendTimeRef.current = Date.now();
+    if (requestIsRecommendation) {
+      beginRecommendationFlow();
+    } else {
+      setRecommendationStatus('idle');
+      setRecommendationError('');
+    }
+
+    const currentProblemId = Number.parseInt(searchProblemId, 10);
+    const chatPayload = {
+      message: userText,
+      history: messages.map(msg => ({role: msg.role, text: msg.text})),
+      current_problem_id: Number.isFinite(currentProblemId) ? currentProblemId : undefined,
+    };
 
     try {
       const res = await fetch(`${API_BASE_URL}/chat/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          message: userText, 
-          history: messages.map(msg => ({role: msg.role, text: msg.text})),
-          current_problem_id: parseInt(searchProblemId) || null
-        }),
+        body: JSON.stringify(chatPayload),
       });
       if (!res.body) throw new Error("스트리밍 오류");
+      if (!res.ok) throw new Error("서버 응답 오류");
       const reader = res.body.getReader();
       const decoder = new TextDecoder('utf-8');
       let done = false;
       setIsLoading(true);
+      let streamedText = '';
       while (!done) {
         const { value, done: readerDone } = await reader.read();
         done = readerDone;
         if (value) {
           const chunk = decoder.decode(value, { stream: true });
+          streamedText += chunk;
+          if (requestIsRecommendation) {
+            markRecommendationStepFromChunk(chunk);
+          }
           setMessages(prev => {
             const newMessages = [...prev];
             const lastIdx = newMessages.length - 1;
             const updatedText = newMessages[lastIdx].text + chunk;
             newMessages[lastIdx] = { ...newMessages[lastIdx], text: updatedText };
-
-            // 사고 과정 실시간 추출 → 로딩 상태에 표시
-            const tStart = updatedText.indexOf('[THOUGHT]');
-            const tEnd = updatedText.indexOf('[/THOUGHT]');
-            if (tStart !== -1) {
-              if (tEnd !== -1) {
-                setThinkingText(updatedText.substring(tStart + 9, tEnd).trim());
-              } else {
-                setThinkingText(updatedText.substring(tStart + 9).trim());
-              }
-            }
-
             return newMessages;
           });
         }
       }
-      setMessages(prev => {
-        const newMessages = [...prev];
-        const lastIdx = newMessages.length - 1;
-        const finalMessage = newMessages[lastIdx].text;
-
-        // 정규식으로 [LOAD_PROBLEM:숫자] 형태를 찾습니다.
-        const match = finalMessage.match(/\[LOAD_PROBLEM:(\d+)\]/);
-        
-        if (match) {
-          const problemId = match[1]; // 숫자(예: 1005)만 추출
-          
-          // 사용자 화면에서는 이 태그가 보이지 않도록 깔끔하게 지워줍니다.
-          newMessages[lastIdx].text = finalMessage.replace(match[0], '').trim() + '\n\n⏳ 추천된 문제(워크스페이스)로 잠시 후 이동합니다...';
-          // 1. 메시지 업데이트 (안내 문구 추가)
-          setMessages(prev => {
-            const updated = [...prev];
-            updated[updated.length - 1].text += "\n\n🎯 태영님께 최적화된 문제를 찾았습니다. 3초 후 워크스페이스로 이동합니다...";
-            return updated;
-          });
-          
-          // 2초 뒤에 탭을 전환하고 문제를 로드합니다. (자연스러운 UX를 위해 약간의 딜레이)
-          setTimeout(() => {
-            setActiveTab('problem'); // 워크스페이스 탭으로 자동 이동!
-            loadProblem(problemId);  // 수정한 함수를 통해 즉시 데이터 로드!
-          }, 3000);
-        }
-        return newMessages;
-      });
       // 응답 시간 계산 후 마지막 AI 메시지에 기록
-      const elapsed = Math.round((Date.now() - sendTimeRef.current) / 1000);
+      const elapsedMs = Date.now() - sendTimeRef.current;
+      const elapsed = Math.round(elapsedMs / 1000);
+      const recommendationResult = requestIsRecommendation
+        ? parseRecommendationResult(streamedText, elapsedMs)
+        : null;
       setMessages(prev => {
         const updated = [...prev];
-        updated[updated.length - 1] = { ...updated[updated.length - 1], elapsed };
+        const lastMessage = updated[updated.length - 1];
+        updated[updated.length - 1] = {
+          ...lastMessage,
+          text: stripRecommendationMarkup(lastMessage.text),
+          elapsed,
+          recommendationResult: recommendationResult ?? undefined,
+        };
         return updated;
       });
+      if (requestIsRecommendation) {
+        if (recommendationResult) {
+          completeRecommendationFlow('success');
+        } else {
+          setRecommendationError('추천 결과를 카드로 정리하지 못했습니다. 다시 시도해 주세요.');
+          completeRecommendationFlow('error');
+        }
+      }
       setIsLoading(false);
-      setThinkingText('');
     } catch (error) {
       console.error("통신 오류:", error);
+      setMessages(prev => {
+        const updated = [...prev];
+        const lastIdx = updated.length - 1;
+        if (updated[lastIdx]?.role === 'ai') {
+          updated[lastIdx] = {
+            ...updated[lastIdx],
+            text: '서버와 통신하는 중 문제가 발생했습니다. 잠시 후 다시 시도해 주세요.',
+          };
+        }
+        return updated;
+      });
+      if (requestIsRecommendation) {
+        setRecommendationError('추천 요청이 실패했습니다. 네트워크 상태나 Gemini API 설정을 확인한 뒤 다시 시도해 주세요.');
+        completeRecommendationFlow('error');
+      }
       setIsLoading(false);
-      setThinkingText('');
     }
   };
 
@@ -198,7 +428,16 @@ function App() {
         fetchMemo(parseInt(targetId));
         if (specificId) setSearchProblemId(targetId);
       }
-    } catch (error: any) { alert("문제 로드 실패: " + error.message); }
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : '알 수 없는 오류';
+      alert("문제 로드 실패: " + message);
+    }
+  };
+
+  const openProblem = (problem: RecommendedProblem) => {
+    const problemId = String(problem.problemId);
+    setActiveTab('problem');
+    loadProblem(problemId);
   };
 
   const handleJudge = async () => {
@@ -214,7 +453,7 @@ function App() {
       const response = await res.json();
       if (response.status === 'success') setJudgeResults(response.results);
       else alert(response.detail || "채점 중 오류 발생");
-    } catch (error) { alert("서버 연결 실패"); } finally { setIsLoading(false); }
+    } catch { alert("서버 연결 실패"); } finally { setIsLoading(false); }
   };
 
   const handleSaveMemo = async () => {
@@ -227,7 +466,122 @@ function App() {
         body: JSON.stringify({ problem_id: parseInt(searchProblemId), content: memo }),
       });
       alert("학습 내용이 저장되었습니다.");
-    } catch (error) { alert("메모 저장 실패"); } finally { setIsSavingMemo(false); }
+    } catch { alert("메모 저장 실패"); } finally { setIsSavingMemo(false); }
+  };
+
+  const renderStepIcon = (status: RecommendationStepStatus) => {
+    if (status === 'completed') return <CheckCircle2 className="w-4 h-4 text-green-400" />;
+    if (status === 'running') return <Loader2 className="w-4 h-4 text-blue-400 animate-spin" />;
+    if (status === 'error') return <AlertCircle className="w-4 h-4 text-red-400" />;
+    return <Circle className="w-4 h-4 text-gray-600" />;
+  };
+
+  const renderRecommendationProgress = () => {
+    if (recommendationStatus === 'idle') return null;
+    const isFinished = recommendationStatus === 'success' || recommendationStatus === 'error';
+    const activeStep = recommendationSteps.find((step) => step.status === 'running');
+    const title = recommendationStatus === 'success'
+      ? `추천 완료 · 총 ${formatElapsed(recommendationElapsedMs)}`
+      : recommendationStatus === 'error'
+        ? `추천 실패 · ${formatElapsed(recommendationElapsedMs)} 경과`
+        : `추천 분석 중 · ${formatElapsed(recommendationElapsedMs)} 경과`;
+
+    return (
+      <div className="w-full max-w-4xl mb-4 rounded-2xl border border-blue-500/20 bg-[#1A1B1E] p-4">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <div className="flex items-center gap-2 text-sm font-semibold text-blue-300">
+              <Clock3 className="w-4 h-4" />
+              {title}
+            </div>
+            <p className="mt-1 text-xs text-gray-400">
+              {recommendationError || activeStep?.label || '추천 결과를 카드로 정리하고 있습니다.'}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setIsProcessOpen((prev) => !prev)}
+            className="inline-flex items-center gap-2 rounded-xl border border-white/10 px-3 py-2 text-xs text-gray-300 hover:bg-white/5"
+          >
+            <ListChecks className="w-4 h-4" />
+            추천 과정 보기
+          </button>
+        </div>
+        {isProcessOpen && (
+          <div className="mt-4 space-y-2 border-t border-white/5 pt-4">
+            {recommendationSteps.map((step) => (
+              <div key={step.id} className="flex items-start gap-3 text-xs">
+                <div className="mt-0.5">{renderStepIcon(step.status)}</div>
+                <div className={step.status === 'pending' ? 'text-gray-500' : 'text-gray-300'}>
+                  {step.label}
+                </div>
+              </div>
+            ))}
+            {isFinished && recommendationStatus === 'success' && (
+              <p className="pt-1 text-xs text-green-400">추천 결과를 확인한 뒤 원하는 문제를 직접 선택하세요.</p>
+            )}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const renderRecommendationCards = (result?: RecommendationResult): React.ReactNode => {
+    if (!result) return null;
+    return (
+      <div className="mt-4 space-y-3">
+        <div>
+          <div className="text-sm font-semibold text-white">오늘의 추천 문제 Top {result.recommendations.length}</div>
+          <div className="text-xs text-gray-500">추천 완료 · 총 {formatElapsed(result.elapsedMs)}</div>
+          {result.summary && <p className="mt-2 text-xs leading-relaxed text-gray-400">{result.summary}</p>}
+        </div>
+        <div className="grid grid-cols-1 gap-3">
+          {result.recommendations.map((problem) => {
+            const tierInfo = getTierInfo(problem.level || problem.tier);
+            return (
+              <div key={`${problem.rank}-${problem.problemId}`} className="rounded-2xl border border-gray-800 bg-black/20 p-4">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                  <div className="min-w-0">
+                    <div className="mb-2 flex flex-wrap items-center gap-2">
+                      <span className="rounded-lg border border-blue-400/30 bg-blue-400/10 px-2.5 py-1 text-xs font-bold text-blue-300">
+                        {problem.rank}순위
+                      </span>
+                      <span className={`rounded-lg border px-2.5 py-1 text-xs font-bold ${tierInfo.bg} ${tierInfo.color} ${tierInfo.border}`}>
+                        {tierInfo.name}
+                      </span>
+                    </div>
+                    <h3 className="break-words text-base font-bold text-gray-100">
+                      {problem.problemId}. {problem.title}
+                    </h3>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => openProblem(problem)}
+                    className="inline-flex shrink-0 items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-blue-500 via-purple-500 to-purple-600 px-3 py-2 text-xs font-bold text-white shadow-lg shadow-purple-500/20 hover:opacity-90"
+                  >
+                    <ExternalLink className="w-4 h-4" />
+                    이 문제 풀러가기
+                  </button>
+                </div>
+                {problem.tags && problem.tags.length > 0 && (
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {problem.tags.map((tag) => (
+                      <span key={`${problem.problemId}-${tag}`} className="rounded-full border border-purple-500/20 bg-purple-500/10 px-2.5 py-1 text-[11px] text-purple-200">
+                        #{tag}
+                      </span>
+                    ))}
+                  </div>
+                )}
+                <p className="mt-3 text-xs leading-relaxed text-gray-300">{problem.reason}</p>
+                {problem.learningEffect && (
+                  <p className="mt-2 text-xs leading-relaxed text-gray-500">기대 학습 효과: {problem.learningEffect}</p>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
   };
 
   return (
@@ -269,35 +623,21 @@ function App() {
                     대화 초기화
                   </button>
                 </div>
+                {renderRecommendationProgress()}
                 <div ref={scrollRef} className="w-full space-y-6 py-4 overflow-y-auto max-h-[70vh] scroll-smooth custom-scrollbar">
                   {messages.map((msg, i) => {
-                    // [THOUGHT] 태그에서 사고 과정과 본문을 분리
-                    let thoughtText = '';
-                    let contentText = msg.text;
-                    if (msg.role === 'ai') {
-                      const tStart = msg.text.indexOf('[THOUGHT]');
-                      const tEnd = msg.text.indexOf('[/THOUGHT]');
-                      if (tStart !== -1 && tEnd !== -1) {
-                        thoughtText = msg.text.substring(tStart + 9, tEnd).trim();
-                        contentText = msg.text.substring(tEnd + 10).trim();
-                      } else if (tStart !== -1) {
-                        thoughtText = msg.text.substring(tStart + 9).trim();
-                        contentText = '';
-                      }
-                    }
-
+                    const contentText = msg.role === 'ai' ? stripRecommendationMarkup(msg.text) : msg.text;
                     const isStreaming = isLoading && i === messages.length - 1;
 
                     return (
                       <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                         <div className={`max-w-[85%] rounded-2xl ${msg.role === 'user' ? 'bg-gradient-to-br from-blue-500 via-purple-500 to-purple-600 text-white shadow-lg p-4' : ''}`}>
                           {msg.role === 'ai' && isStreaming && !contentText ? (
-                            // 로딩 상태: 사고 과정을 독립 카드로 표시
                             <div className="p-4 bg-[#1A1B1E] border border-blue-500/20 rounded-2xl animate-pulse-subtle">
                               <div className="flex items-center gap-2 mb-2 text-blue-400 font-semibold text-sm">
                                 <Brain className="w-4 h-4 animate-spin" style={{ animationDuration: '3s' }} /> 분석 중...
                               </div>
-                              <p className="text-xs text-gray-400 leading-relaxed">{thinkingText || '질문을 분석하고 최적의 문제를 탐색하고 있습니다...'}</p>
+                              <p className="text-xs text-gray-400 leading-relaxed">질문을 분석하고 필요한 데이터를 확인하고 있습니다.</p>
                               <div className="flex gap-1 items-center mt-3">
                                 <div className="w-1.5 h-1.5 bg-blue-400/50 rounded-full animate-bounce" style={{ animationDelay: '0ms' }}></div>
                                 <div className="w-1.5 h-1.5 bg-blue-400/50 rounded-full animate-bounce" style={{ animationDelay: '200ms' }}></div>
@@ -305,24 +645,11 @@ function App() {
                               </div>
                             </div>
                           ) : msg.role === 'ai' ? (
-                            // 답변 완료 상태: 사고 과정 + 본문
                             <div className="p-4 bg-[#1E1F20] text-gray-200 border border-gray-800 rounded-2xl">
-                              {thoughtText && (
-                                <details className="mb-3 group">
-                                  <summary className="flex items-center gap-2 cursor-pointer text-xs text-blue-400/70 hover:text-blue-400 transition-colors select-none">
-                                    <Brain className="w-3 h-3" />
-                                    <span className="font-semibold">사고 과정 보기</span>
-                                    <span className="text-gray-600 group-open:hidden">▶</span>
-                                    <span className="text-gray-600 hidden group-open:inline">▼</span>
-                                  </summary>
-                                  <div className="mt-2 p-3 bg-black/20 border border-white/5 rounded-xl text-xs text-gray-400 italic leading-relaxed">
-                                    {thoughtText}
-                                  </div>
-                                </details>
-                              )}
                               {contentText && <p className="text-sm leading-relaxed whitespace-pre-wrap">{contentText}</p>}
+                              {renderRecommendationCards(msg.recommendationResult)}
                               {msg.elapsed !== undefined && (
-                                <p className="text-[10px] text-gray-600 mt-3 text-right">⏱ 응답 시간: {msg.elapsed}초</p>
+                                <p className="text-[10px] text-gray-600 mt-3 text-right">응답 시간: {msg.elapsed}초</p>
                               )}
                             </div>
                           ) : (
@@ -513,11 +840,11 @@ function App() {
 
       {/* 플로팅 하단 바 */}
       <div className="fixed bottom-6 left-0 right-0 px-6 pointer-events-none flex justify-center">
-        <div className={`bg-[#1E1F20]/80 backdrop-blur-xl border border-white/10 rounded-3xl p-2 shadow-2xl flex pointer-events-auto transition-all duration-300 ${activeTab === 'chat' ? 'w-full max-w-md' : 'w-fit'}`}>
+        <div className={`bg-[#1E1F20]/80 backdrop-blur-xl border border-white/10 rounded-3xl p-2 shadow-2xl flex items-center pointer-events-auto transition-all duration-300 ${activeTab === 'chat' ? 'w-full max-w-3xl' : 'w-fit'}`}>
           {activeTab === 'chat' && (
-            <div className="flex-1 flex items-end bg-[#131314]/50 rounded-2xl border border-white/5 px-3 py-1 mr-2">
-              <textarea ref={textareaRef} value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && (e.preventDefault(), handleSend())} placeholder="메시지 입력..." className="w-full bg-transparent resize-none outline-none py-2 text-xs text-gray-300 max-h-24" rows={1} />
-              <button onClick={handleSend} disabled={!input.trim() || isLoading} className="p-2 hover:scale-110 transition-all"><div className="bg-gradient-to-r from-blue-400 via-purple-400 to-purple-600 rounded-full p-1.5 shadow-lg"><Send className="w-3.5 h-3.5 text-white" /></div></button>
+            <div className="mr-2 flex h-14 min-w-0 flex-1 items-center rounded-2xl border border-white/5 bg-[#131314]/50 px-3">
+              <textarea ref={textareaRef} value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && (e.preventDefault(), handleSend())} placeholder="메시지 입력..." className="h-10 max-h-10 min-w-0 flex-1 resize-none overflow-y-auto bg-transparent py-1.5 pr-2 text-xs leading-5 text-gray-300 outline-none custom-scrollbar" rows={2} />
+              <button onClick={handleSend} disabled={!input.trim() || isLoading} className="shrink-0 p-2 hover:scale-110 transition-all disabled:opacity-50"><div className="bg-gradient-to-r from-blue-400 via-purple-400 to-purple-600 rounded-full p-1.5 shadow-lg"><Send className="w-3.5 h-3.5 text-white" /></div></button>
             </div>
           )}
           <div className="flex gap-1">
